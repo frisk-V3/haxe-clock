@@ -1,26 +1,132 @@
-name: Build Haxe Clock
+name: Build and Deploy Haxe Clock
+
+concurrency:
+  group: haxe-clock-build
+  cancel-in-progress: true
 
 on:
   push:
     branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
   build:
+    name: Build (Haxe → JS)
     runs-on: ubuntu-latest
+    outputs:
+      dist-exists: ${{ steps.check-dist.outputs.exists }}
+      has-haxelib: ${{ steps.check-haxelib.outputs.exists }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Install Haxe
+      - name: Install Haxe (no Neko)
         uses: krdlab/setup-haxe@v1
         with:
-          haxe-version: latest
+          haxe-version: 4.3.3
+
+      - name: Show Haxe version
+        run: |
+          haxe --version
+          haxelib version || true
+
+      - name: Check for haxelib.json or haxelib.lock
+        id: check-haxelib
+        run: |
+          if [ -f haxelib.json ] || [ -f haxelib.lock ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Cache haxelib directory
+        if: steps.check-haxelib.outputs.exists == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.haxelib
+          key: ${{ runner.os }}-haxelib-${{ hashFiles('haxelib.json') }}
+          restore-keys: |
+            ${{ runner.os }}-haxelib-
+
+      - name: Install haxelib deps
+        if: steps.check-haxelib.outputs.exists == 'true'
+        run: |
+          set -e
+          if [ -f haxelib.json ]; then
+            haxelib install
+          fi
+
+      - name: Ensure dist directory exists
+        run: mkdir -p dist
 
       - name: Build
-        run: haxe main.hxml
+        run: |
+          set -e
+          haxe main.hxml
 
-      - name: Upload dist
+      - name: Check dist exists
+        id: check-dist
+        run: |
+          if [ -d dist ] && [ "$(ls -A dist 2>/dev/null)" != "" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "No build output found in dist/ — failing." >&2
+            exit 1
+          fi
+
+      - name: Smoke test - ensure main.js exists
+        if: steps.check-dist.outputs.exists == 'true'
+        run: |
+          if [ ! -f dist/main.js ]; then
+            echo "dist/main.js not found" >&2
+            ls -la dist
+            exit 1
+          fi
+          echo "dist/main.js exists"
+
+      - name: Upload build artifact
+        if: steps.check-dist.outputs.exists == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist
+
+  deploy_pages:
+    name: Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    needs: build
+    if: needs.build.outputs.dist-exists == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: List dist contents
+        run: ls -la dist
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v1
+        with:
+          path: dist
+
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v1
+
+      - name: Post-deploy info
+        run: echo "Pages deployed. Check repository settings -> Pages for URL."
